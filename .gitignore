@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data (keep raw data out of git if large)
+data/raw/*.csv
+data/raw/*.json
+data/processed/*.csv
+
+# OS
+.DS_Store
+Thumbs.db
