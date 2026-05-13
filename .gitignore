@@ -13,6 +13,7 @@ env/
 # Data (keep raw data out of git if large)
 data/raw/*.csv
 data/raw/*.json
+data/raw/*.zip
 data/processed/*.csv
 
 # OS
