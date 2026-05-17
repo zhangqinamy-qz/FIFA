@@ -21,6 +21,7 @@ FILES = {
     "national_performances": f"{BASE_URL}/player_national_performances/player_national_performances.csv",
     "market_value":          f"{BASE_URL}/player_market_value/player_market_value.csv",
     "profiles":              f"{BASE_URL}/player_profiles/player_profiles.csv",
+    "injuries":              f"{BASE_URL}/player_injuries/player_injuries.csv",
 }
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "raw" / "transfermarkt"
@@ -55,23 +56,37 @@ def download_data(data_dir: Path | str = DEFAULT_DATA_DIR, overwrite: bool = Fal
     return paths
 
 
+def _ensure_local(data_dir: Path | str, filename: str) -> Path:
+    """Return path to filename, re-downloading from GitHub if missing.
+    Lets the caller delete `data/raw/transfermarkt/` (or OneDrive 'Free up space' it)
+    without breaking; first call re-pulls."""
+    p = Path(data_dir) / filename
+    if not p.exists():
+        download_data(data_dir)
+    return p
+
+
 def load_national_performances(data_dir: Path | str = DEFAULT_DATA_DIR) -> pd.DataFrame:
-    p = Path(data_dir) / "player_national_performances.csv"
-    return pd.read_csv(p)
+    return pd.read_csv(_ensure_local(data_dir, "player_national_performances.csv"))
 
 
 def load_market_value(data_dir: Path | str = DEFAULT_DATA_DIR) -> pd.DataFrame:
-    p = Path(data_dir) / "player_market_value.csv"
-    df = pd.read_csv(p, parse_dates=["date_unix"])
+    df = pd.read_csv(_ensure_local(data_dir, "player_market_value.csv"), parse_dates=["date_unix"])
     df = df.rename(columns={"date_unix": "date"})
     return df
 
 
+def load_injuries(data_dir: Path | str = DEFAULT_DATA_DIR) -> pd.DataFrame:
+    """Player injury spells. Each row is one injury: from_date, end_date, days_missed."""
+    df = pd.read_csv(_ensure_local(data_dir, "player_injuries.csv"),
+                     parse_dates=["from_date", "end_date"])
+    return df
+
+
 def load_profiles(data_dir: Path | str = DEFAULT_DATA_DIR) -> pd.DataFrame:
-    p = Path(data_dir) / "player_profiles.csv"
     cols = ["player_id", "player_name", "citizenship", "date_of_birth",
             "main_position", "position", "current_club_id", "current_club_name"]
-    df = pd.read_csv(p, usecols=cols)
+    df = pd.read_csv(_ensure_local(data_dir, "player_profiles.csv"), usecols=cols)
     df["date_of_birth"] = pd.to_datetime(df["date_of_birth"], errors="coerce")
     return df
 
@@ -140,6 +155,96 @@ def _latest_value_on_or_before(player_id: int, as_of: pd.Timestamp,
     return sub.sort_values("date").iloc[-1]["value"]
 
 
+def squad_features_from_players(
+    players: pd.DataFrame,
+    as_of: pd.Timestamp,
+    *,
+    injuries: pd.DataFrame | None = None,
+    top_n: int = 23,
+    n_gk: int = 3,
+) -> dict:
+    """Aggregate squad-level features from a per-player table.
+
+    `players` must have columns: player_id, value, age, is_gk. Builds:
+      - top_n_value_eur (top-N by value, mixed)
+      - outfield_mean_age / gk_mean_age (separate top-(N-n_gk) outfield + top-n_gk GK)
+      - top1_share (top-1 value / top-N value)
+      - injured_value_share, n_injured_top_n (aggregate)
+      - injured_top1 (boolean: is the top-1 player injured at as_of)
+      - injured_top3_share (sum of injured values among top-3 / top-3 value)
+    """
+    if players.empty:
+        return _empty_feature_dict()
+    p = players.sort_values("value", ascending=False).reset_index(drop=True)
+    top_mixed = p.head(top_n)
+    values = top_mixed["value"].to_numpy()
+    total_top_n = float(values.sum())
+    top1 = float(values.max()) if len(values) else 0.0
+
+    outfield = p[~p["is_gk"]].head(max(top_n - n_gk, 0))
+    gks = p[p["is_gk"]].head(n_gk)
+
+    def _wmean(sub):
+        if sub.empty or sub["value"].sum() == 0:
+            return float("nan")
+        return float(np.average(sub["age"], weights=sub["value"]))
+
+    # Injury status: which of the top-N are injured at as_of?
+    injured_value_share = 0.0
+    n_injured = 0
+    injured_top1 = 0
+    injured_top3_share = 0.0
+    if injuries is not None and not top_mixed.empty:
+        top_ids = top_mixed["player_id"].to_numpy()
+        sick = injuries[
+            injuries["player_id"].isin(top_ids)
+            & (injuries["from_date"] <= as_of)
+            & (injuries["end_date"] >= as_of)
+        ]
+        if not sick.empty:
+            injured_ids = set(sick["player_id"].unique())
+            top_mixed_inj = top_mixed.assign(injured=top_mixed["player_id"].isin(injured_ids))
+            injured_value = top_mixed_inj.loc[top_mixed_inj["injured"], "value"].sum()
+            n_injured = int(top_mixed_inj["injured"].sum())
+            injured_value_share = float(injured_value / total_top_n) if total_top_n > 0 else 0.0
+
+            injured_top1 = int(top_mixed_inj.iloc[0]["injured"])
+            top3 = top_mixed_inj.head(3)
+            top3_total = float(top3["value"].sum())
+            if top3_total > 0:
+                injured_top3_share = float(top3.loc[top3["injured"], "value"].sum() / top3_total)
+
+    return {
+        "as_of": as_of.date().isoformat(),
+        "n_players": len(p),
+        "n_with_value": len(values),
+        "total_value_eur": total_top_n,
+        "mean_value_eur": float(values.mean()) if len(values) else 0.0,
+        "top_n_value_eur": total_top_n,
+        "outfield_mean_age": _wmean(outfield),
+        "gk_mean_age": _wmean(gks),
+        "n_outfield": int(len(outfield)),
+        "n_gk": int(len(gks)),
+        "top1_share": (top1 / total_top_n) if total_top_n > 0 else float("nan"),
+        "injured_value_share": injured_value_share,
+        "n_injured_top_n": n_injured,
+        "injured_top1": injured_top1,
+        "injured_top3_share": injured_top3_share,
+        "missing": len(values) == 0,
+    }
+
+
+def _empty_feature_dict() -> dict:
+    return {
+        "as_of": None, "n_players": 0, "n_with_value": 0,
+        "total_value_eur": 0.0, "mean_value_eur": 0.0, "top_n_value_eur": 0.0,
+        "outfield_mean_age": float("nan"), "gk_mean_age": float("nan"),
+        "n_outfield": 0, "n_gk": 0, "top1_share": float("nan"),
+        "injured_value_share": 0.0, "n_injured_top_n": 0,
+        "injured_top1": 0, "injured_top3_share": 0.0, "missing": True,
+    }
+
+
 def squad_value(
     country: str,
     as_of_date: str | pd.Timestamp = None,
@@ -206,9 +311,11 @@ def historical_squad_value(
     perfs: pd.DataFrame,
     profiles: pd.DataFrame,
     market_value: pd.DataFrame,
+    injuries: pd.DataFrame | None = None,
     min_age: int = 17,
     max_age: int = 37,
     top_n: int = 23,
+    n_gk: int = 3,
 ) -> dict:
     """Approximate squad market value at a historical date.
 
@@ -232,30 +339,26 @@ def historical_squad_value(
     # All players who ever played for this national team
     candidate_ids = perfs.loc[perfs["team_id"] == team_id, "player_id"].unique()
     cand = profiles[profiles["player_id"].isin(candidate_ids) & profiles["date_of_birth"].notna()].copy()
-    age = (as_of - cand["date_of_birth"]).dt.days / 365.25
-    cand = cand[(age >= min_age) & (age <= max_age)]
-    eligible_ids = cand["player_id"].to_numpy()
+    cand["age"] = (as_of - cand["date_of_birth"]).dt.days / 365.25
+    cand = cand[(cand["age"] >= min_age) & (cand["age"] <= max_age)]
+    cand["is_gk"] = cand["main_position"].eq("Goalkeeper")
+    eligible = cand[["player_id", "age", "is_gk"]]
 
-    mv = market_value[market_value["player_id"].isin(eligible_ids) & (market_value["date"] <= as_of)]
+    mv = market_value[market_value["player_id"].isin(eligible["player_id"]) & (market_value["date"] <= as_of)]
     latest = (
         mv.sort_values("date")
           .groupby("player_id", as_index=False)
           .tail(1)
           [["player_id", "value"]]
     )
-    values = latest["value"].to_numpy()
-    values_sorted = np.sort(values)[::-1]
+    players = latest.merge(eligible, on="player_id", how="left")
 
+    feats = squad_features_from_players(players, as_of, injuries=injuries, top_n=top_n, n_gk=n_gk)
     return {
         "country": country,
         "team_id": team_id,
-        "as_of": as_of.date().isoformat(),
-        "n_eligible": len(eligible_ids),
-        "n_with_value": len(values),
-        "total_value_eur": float(values.sum()) if len(values) else 0.0,
-        "mean_value_eur": float(values.mean()) if len(values) else 0.0,
-        "top_n_value_eur": float(values_sorted[:top_n].sum()) if len(values) else 0.0,
-        "missing": len(values) == 0,
+        "n_eligible": int(cand.shape[0]),
+        **feats,
     }
 
 
@@ -266,6 +369,7 @@ def squad_value_for_matches(
     perfs: pd.DataFrame,
     profiles: pd.DataFrame,
     market_value: pd.DataFrame,
+    injuries: pd.DataFrame | None = None,
     top_n: int = 23,
     snapshot: str = "month",
 ) -> pd.DataFrame:
@@ -289,18 +393,22 @@ def squad_value_for_matches(
         out[["away_team", "snapshot"]].rename(columns={"away_team": "country"}),
     ]).drop_duplicates().reset_index(drop=True)
 
-    cache: dict[tuple, float] = {}
+    cache: dict[tuple, dict] = {}
     for _, p in pairs.iterrows():
         key = (p["country"], p["snapshot"])
         info = historical_squad_value(
             p["country"], p["snapshot"],
             team_map=team_map, perfs=perfs, profiles=profiles, market_value=market_value,
-            top_n=top_n,
+            injuries=injuries, top_n=top_n,
         )
-        cache[key] = info["top_n_value_eur"]
+        cache[key] = info
 
-    out["home_top_n_value_eur"] = out.apply(lambda r: cache.get((r["home_team"], r["snapshot"])), axis=1)
-    out["away_top_n_value_eur"] = out.apply(lambda r: cache.get((r["away_team"], r["snapshot"])), axis=1)
+    extracted = ["top_n_value_eur", "outfield_mean_age", "gk_mean_age", "top1_share", "injured_value_share"]
+    for col in extracted:
+        out[f"home_{col}" if col != "top_n_value_eur" else "home_top_n_value_eur"] = out.apply(
+            lambda r, c=col: cache.get((r["home_team"], r["snapshot"]), {}).get(c), axis=1)
+        out[f"away_{col}" if col != "top_n_value_eur" else "away_top_n_value_eur"] = out.apply(
+            lambda r, c=col: cache.get((r["away_team"], r["snapshot"]), {}).get(c), axis=1)
     return out.drop(columns=["snapshot"])
 
 

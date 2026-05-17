@@ -1,14 +1,17 @@
+# Strength multipliers used directly as a K-factor discount when the opponent
+# is from this confederation. UEFA = 1.0 reference (top European leagues, strong
+# at all levels). AFC/CAF heavily discounted because the strength range within
+# them is huge — beating Kyrgyzstan or Liechtenstein-equivalent is less
+# informative than beating an average European opponent. Tuned 2026-05-16 after
+# observing Iran's Elo inflating above Belgium's via AFC qualifying farming.
 CONFEDERATION_STRENGTH = {
     'UEFA':     1.00,
-    'CONMEBOL': 0.95,
-    'CONCACAF': 0.75,
-    'AFC':      0.70,
-    'CAF':      0.65,
-    'OFC':      0.50,
+    'CONMEBOL': 0.90,
+    'CONCACAF': 0.55,
+    'AFC':      0.50,
+    'CAF':      0.45,
+    'OFC':      0.30,
 }
-
-# Weighted global average (used to normalise the discount)
-_GLOBAL_AVG = sum(CONFEDERATION_STRENGTH.values()) / len(CONFEDERATION_STRENGTH)
 
 TEAM_CONFEDERATION = {
     # UEFA
@@ -89,6 +92,11 @@ def get_confederation(team: str) -> str:
     return TEAM_CONFEDERATION.get(team, 'UEFA')  # default to UEFA if unknown
 
 def confederation_k_multiplier(opponent: str) -> float:
-    """Reduce K for weak confederation matches; never inflate above baseline."""
-    conf = get_confederation(opponent)
-    return min(CONFEDERATION_STRENGTH[conf] / _GLOBAL_AVG, 1.0)
+    """Reduce K based on the opponent's confederation strength.
+
+    Returned values: UEFA 1.00, CONMEBOL 0.90, CONCACAF 0.55, AFC 0.50,
+    CAF 0.45, OFC 0.30. Lower multiplier = less Elo update per match.
+    Rationale: beating a weak-confederation opponent is less informative
+    about your true skill than beating a UEFA opponent of equivalent rank.
+    """
+    return CONFEDERATION_STRENGTH[get_confederation(opponent)]
