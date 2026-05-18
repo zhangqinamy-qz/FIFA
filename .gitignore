@@ -13,8 +13,16 @@ env/
 # Data (keep raw data out of git if large)
 data/raw/**/*.csv
 data/raw/**/*.json
+data/raw/**/*.json.gz
 data/raw/**/*.zip
 data/processed/**/*.csv
+data/processed/**/*.log
+
+# Editor / agent local state
+.claude/
+
+# Empty stub at repo root (real lockfile is viz/package-lock.json)
+/package-lock.json
 
 # OS
 .DS_Store
